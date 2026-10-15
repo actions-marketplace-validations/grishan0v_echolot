@@ -393,9 +393,10 @@ pipx install echolot                          # the CLI the skills drive
 
   ```bash
   v=$(echolot --version | awk '{print $2}')
-  git clone --quiet --depth 1 --branch "v$v" https://github.com/grishan0v/echolot "$TMPDIR/echolot-$v"
+  git -c advice.detachedHead=false clone --quiet --depth 1 --branch "v$v" \
+    https://github.com/grishan0v/echolot "${TMPDIR:-/tmp}/echolot-$v"
   rm -rf ~/.cursor/plugins/local/echolot
-  cp -R "$TMPDIR/echolot-$v/plugins/echolot" ~/.cursor/plugins/local/echolot
+  cp -R "${TMPDIR:-/tmp}/echolot-$v/plugins/echolot" ~/.cursor/plugins/local/echolot
   ```
 
   Customize lists it, with its four skills. The door is the `echolot` skill,
@@ -404,6 +405,13 @@ pipx install echolot                          # the CLI the skills drive
   subagent. `.cursor-plugin/marketplace.json` at the root is what Cursor's
   team marketplaces import from the repository. It serves the default
   branch, which between releases can be ahead of the echolot on PyPI.
+
+  Cursor's community catalog lists the plugin at
+  [cursor.directory/plugins/echolot](https://cursor.directory/plugins/echolot).
+  The listing shows the text of the four skills, copied from this
+  repository, with a button that copies each one. To use them, install the
+  plugin as above: that keeps the four skills together, at the release of
+  the echolot installed.
 
 Claude Code needs git 2.36 or newer on `PATH` for this. It fetches
 `plugins/echolot` with a sparse checkout of a partial clone, and tries the
