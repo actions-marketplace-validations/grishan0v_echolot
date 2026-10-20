@@ -56,6 +56,8 @@ TID_DISK = 4209
 TID_DISK_BG = 4210
 TID_ROOM_0 = 4211
 TID_ROOM_1 = 4212
+TID_JIT = 4213
+TID_LOADER = 4215
 
 THREADS = {
     # The main thread's name cut from the front, the way a package name
@@ -75,6 +77,11 @@ THREADS = {
     # Room's disk executor, whose threads wake the main thread below.
     TID_ROOM_0: "arch_disk_io_0",
     TID_ROOM_1: "arch_disk_io_1",
+    # ART's compiler, whose methods compiled in the window `environment` counts.
+    TID_JIT: "Jit thread pool",
+    # Loads a native library while the main thread is inside `inflate`, and
+    # is the thread that lets it out of the kernel (WAKINGS).
+    TID_LOADER: "NativeLoader",
 }
 
 # --- a foreign process: the process-isolation control ----------------------
@@ -280,7 +287,19 @@ SLICES = {
     ],
     TID_MAIN: [
         # BEFORE the window — main_thread_block must not see it
-        ("Bootstrap_OUTSIDE", 0, 50, []),
+        # Before the window, as a process opens its dex at its start: the
+        # compile state `environment.compile` reads off the whole trace. The
+        # first is another package's file, verified only, and must not be
+        # taken for the app's: the app's own is told by the path its parent
+        # names, not by coming first.
+        ("Bootstrap_OUTSIDE", 0, 50, [
+            ("OpenDexFilesFromOat(/data/app/~~d2Vi==/com.google.android.webview-dmlldw==/base.apk)",
+             5, 4, [("location=/data/app/~~d2Vi==/com.google.android.webview-dmlldw==/oat/arm64/"
+                     "base.odex status=up-to-date filter=verify reason=vdex", 6, 1, [])]),
+            ("OpenDexFilesFromOat(/data/app/~~Zm9v==/com.example.app-YmFy==/base.apk)",
+             20, 4, [("location=/data/app/~~Zm9v==/com.example.app-YmFy==/oat/arm64/"
+                      "base.odex status=up-to-date filter=speed-profile reason=install-dm", 21, 1, [])]),
+        ]),
         # The start anchor. Wraps the whole scenario, as on a real startup.
         ("AppStart", 100, 1006, [
             # app_init: the stretch a cold start spends between the
@@ -469,9 +488,34 @@ SLICES = {
     # uninstrumented_cpu negative control: 180 ms of slices over 200 ms of
     # Running = 90% coverage, so the thread must NOT land in the blind spots.
     TID_INSTR: [
-        ("work_a", 200, 90, []),
-        ("work_b", 300, 90, []),
+        # Classes ART verified at run time, as `environment.compile` counts
+        # them: Store and Feed, 5 ms. FeedBase is verified inside Feed and is
+        # Feed's time already; a class loader's check is not a class.
+        ("work_a", 200, 90, [
+            ("VerifyClass com.example.app.Store", 210, 3, []),
+            ("VerifyClassLoaderContextMatch", 250, 1, []),
+        ]),
+        ("work_b", 300, 90, [
+            ("VerifyClass com.example.app.Feed", 310, 2, [
+                ("VerifyClass com.example.app.FeedBase", 310.5, 1, []),
+            ]),
+        ]),
     ],
+    # Two methods compiled inside the window, 10 ms, and one after it closes,
+    # which the window's count leaves out.
+    TID_JIT: [
+        ("JIT compiling void com.example.app.Store.load() (kind=Baseline) from "
+         "/data/app/~~Zm9v==/com.example.app-YmFy==/base.apk", 300, 4, [
+             ("Compiling baseline", 300.5, 3, [])]),
+        ("JIT compiling void com.example.app.Feed.bind() (kind=Optimized) from "
+         "/data/app/~~Zm9v==/com.example.app-YmFy==/base.apk", 600, 6, [
+             ("Compiling optimized", 600.5, 5, [])]),
+        ("JIT compiling void com.example.app.Late.run() (kind=Baseline) from "
+         "/data/app/~~Zm9v==/com.example.app-YmFy==/base.apk", 1150, 2, []),
+    ],
+    # The library load the main thread waited on in the kernel, from 360 to
+    # 380 ms, by NativeLoader's wakeup at its end.
+    TID_LOADER: [("dlopen: libimage.so", 350, 40, [])],
     # uninstrumented_cpu: a 300 ms slice by wall clock, but the thread sleeps
     # through most of it — only 60 ms on CPU. Plus 100 ms of Running with no
     # slices at all. Comparing slice duration against on-CPU time would give
@@ -542,7 +586,12 @@ SCHED = [
     # correctly, since a thread parked in the kernel is not serving the looper
     # either.
     (0, TID_MAIN, 50, 200, D),
-    (0, TID_MAIN, 260, 600, S),
+    # Held in the kernel for something other than the disk, twice: 20 ms
+    # inside `inflate`, ended by NativeLoader while it was in `dlopen`, and
+    # 2 ms more that another process ended. Only the first is the app's.
+    (0, TID_MAIN, 260, 360, D),
+    (0, TID_MAIN, 380, 384, D),
+    (0, TID_MAIN, 386, 600, S),
     (0, TID_MAIN, 610, 692, S),
     # Asleep 692..698 inside `loadConfig`, until Room's thread wakes it.
     (0, TID_MAIN, 698, 800, S),
@@ -621,6 +670,13 @@ SCHED = [
     (8, TID_ROOM_0, 857, 860, S),
     (8, TID_ROOM_0, 1094, 1098, S),
 
+    # The JIT's thread, on a CPU only after the window: its slices need a
+    # thread the trace knows, and its CPU time would move the window's clock.
+    (7, TID_JIT, 1300, 1301, S),
+    # NativeLoader the same way: on a CPU only after the window, so that its
+    # slice and its wakeups need not move the window's clock.
+    (7, TID_LOADER, 1302, 1303, S),
+
     # the foreign process
     (5, OTHER_PID, 200, 700, S),
 ]
@@ -632,6 +688,11 @@ SCHED = [
 # would be `runnable_starvation`'s, which this fixture keeps for its own case.
 WAKINGS = [
     (698, TID_ROOM_1, TID_MAIN),
+    # The main thread out of the kernel: the disk (260) and the app's dlopen
+    # (380) by NativeLoader, and the short one (386) by another process.
+    (260, TID_LOADER, TID_MAIN),
+    (380, TID_LOADER, TID_MAIN),
+    (386, OTHER_PID, TID_MAIN),
     (860, TID_ROOM_0, TID_MAIN),
     (1098, TID_ROOM_0, TID_MAIN),
 ]
@@ -645,6 +706,8 @@ WAKINGS = [
 # 6683 of 6683 — and the fixture reproduces the phone rather than the ideal.
 BLOCKED_REASON = [
     (TID_MAIN, 200, 1),
+    (TID_MAIN, 360, 0),
+    (TID_MAIN, 384, 0),
     (TID_DISK, 160, 1),
     (TID_DISK, 320, 1),
     (TID_DISK, 420, 1),
@@ -1058,8 +1121,45 @@ ANR_COUNTERS = [
 ]
 
 
+# --- a crowded variant: who held the main thread's core ------------------------
+#
+# `build(crowded=True)` only; the default trace keeps the main thread off the
+# CPU queue, and its budget's `waiting_for_cpu` is pinned at zero.
+#
+# The main thread is preempted at 400 ms and back on CPU 0 at 430. Meanwhile
+# CPU 0 runs a thread of the app for 18 ms and another process's for 8, and
+# stands idle for the last 4: `runnable_starvation`'s main-thread row says
+# the app held the core 60%, other processes 27%, nobody 13%. Twelve more
+# threads of the app queue at once from 880 ms on CPU 9 — more threads ready
+# than the trace has cores — for `window.crowding`.
+TID_CROWD = 4214
+OTHER_WORKER = 5001
+CROWD_TIDS = [4220 + i for i in range(12)]
+
+
+def _crowded(sched: list, threads: dict, other_threads: dict) -> tuple[list, dict, dict]:
+    sched = [row for row in sched if row != (0, TID_MAIN, 386, 600, S)]
+    sched += [
+        (0, TID_MAIN, 386, 400, R),
+        (0, TID_CROWD, 400, 418, S),
+        (0, OTHER_WORKER, 418, 426, S),
+        (0, TID_MAIN, 430, 600, S),
+    ]
+    # Each runs a millisecond and is preempted, then runs again a millisecond
+    # once all twelve have queued.
+    for i, tid in enumerate(CROWD_TIDS):
+        sched.append((9, tid, 880 + i, 881 + i, R))
+    for i, tid in enumerate(CROWD_TIDS):
+        sched.append((9, tid, 950 + i, 951 + i, S))
+    threads = {**threads, TID_CROWD: "CrowdWorker",
+               **{tid: f"Crowd-{i}" for i, tid in enumerate(CROWD_TIDS)}}
+    other_threads = {**other_threads, OTHER_WORKER: "OtherWorker"}
+    return sched, threads, other_threads
+
+
 def build(frames: bool = True, environment: bool = True,
-          sampling: str | None = None, names: bool = False) -> bytes:
+          sampling: str | None = None, names: bool = False,
+          crowded: bool = False) -> bytes:
     """The fixture trace. `frames=False` leaves out the frame timeline.
 
     Android 11 and below, and any trace recorded without the
@@ -1083,10 +1183,17 @@ def build(frames: bool = True, environment: bool = True,
     `names=True` writes the config `runner.compose_names` records with, a
     `track_event` source for Compose's category. The composables themselves
     are in the trace either way: they are slices like any other.
+
+    `crowded=True` puts the main thread in the CPU queue behind the app's own
+    thread and another process's, and more of the app's threads in the
+    queue at once than there are cores (see `_crowded`).
     """
+    sched, threads, other_threads = list(SCHED), dict(THREADS), dict(OTHER_THREADS)
+    if crowded:
+        sched, threads, other_threads = _crowded(sched, threads, other_threads)
     builder = TraceProtoBuilder()
-    process_tree(builder, [(APP_PID, APP_NAME, THREADS),
-                           (OTHER_PID, OTHER_NAME, OTHER_THREADS),
+    process_tree(builder, [(APP_PID, APP_NAME, threads),
+                           (OTHER_PID, OTHER_NAME, other_threads),
                            (SF_PID, SF_NAME, SF_THREADS),
                            (SS_PID, SS_NAME, SS_THREADS)])
 
@@ -1103,16 +1210,16 @@ def build(frames: bool = True, environment: bool = True,
 
     # Collect ftrace events per CPU.
     by_cpu: dict[int, list] = {}
-    tid_to_cpu = {tid: cpu for cpu, tid, *_ in SCHED}
-    tid_to_tgid = {tid: APP_PID for tid in THREADS}
-    tid_to_tgid.update({tid: OTHER_PID for tid in OTHER_THREADS})
-    names = dict(THREADS)
-    names.update(OTHER_THREADS)
+    tid_to_cpu = {tid: cpu for cpu, tid, *_ in sched}
+    tid_to_tgid = {tid: APP_PID for tid in threads}
+    tid_to_tgid.update({tid: OTHER_PID for tid in other_threads})
+    names = dict(threads)
+    names.update(other_threads)
 
     seq = iter(range(10**6))
 
     # sched_switch: entering and leaving Running.
-    for cpu, tid, start, end, end_state in SCHED:
+    for cpu, tid, start, end, end_state in sched:
         idle = f"swapper/{cpu}"
         by_cpu.setdefault(cpu, []).append(
             (ms(start), next(seq), "sched", idle, 0, R, names[tid], tid)

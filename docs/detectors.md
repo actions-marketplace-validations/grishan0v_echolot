@@ -46,6 +46,9 @@ that list it.
 So a column in the identity carries nothing that can change from one repeat
 to the next. `io_wait` is named by `location, thread`: `thread` says `main` or
 `background`, and the kernel functions a thread stopped in stay in `detail`.
+`runnable_starvation` is named by `location, state` the same way: the state,
+`R` or `R+`, is the row's name, and who held the main thread's core is
+evidence in `detail`.
 Which functions those are, and in what order, changes between repeats, and
 with them in the name one thread became a row per variant, each seen once.
 
@@ -67,6 +70,9 @@ project-specific belongs inside a detector.
 | `_cpu_in_slice` | time **on CPU inside** top-level slices |
 | `_samples_by_slice` | the process's **callstack samples** in the window, each marked inside a top-level slice or outside every one |
 | `_claimed_name` | slice names a `*name_glob*` already speaks for |
+| `_sched_win` | what **every CPU** ran in the window, and whose it was: `app`, `other`, or `idle` |
+| `_main_runnable_held` | the main thread's **waits for a CPU**, split by what ran on the core it got next |
+| `_main_runnable_idle` | the same waits against the **other cores' idle** time |
 
 The async ones are kept apart on purpose. A section on no thread has no place
 in a sum per thread — counted with the rest it would land under no thread, at
@@ -487,8 +493,8 @@ writes a config.
   the fixture is the wrong shape to hold one, the way it names `anr_risk`.
   Then the checks that pin what it must find and what it must not, beside the
   others in `selftest.py`.
-- **The README.** `tests/test_docs.py` reads the number in "runs fifteen
-  SQL detectors" and in the sample report's `Detectors fired: **N of 15**`,
+- **The README.** `tests/test_docs.py` reads the number in "runs sixteen
+  SQL detectors" and in the sample report's `Detectors fired: **N of 16**`,
   and fails while either disagrees with the files. The sample report is what
   `analyze` prints for the demo app, `echolot/demo.py`, and
   `tests/test_doc_samples.py` holds it to that character for character, down

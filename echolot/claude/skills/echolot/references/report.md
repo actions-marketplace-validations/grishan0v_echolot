@@ -39,7 +39,9 @@ produce. The keys only a merged report has are named under the block.
                                "window_ms": 772.3, "accounted_pct": 99.7,
                                "in_rows_ms": 401.6, "in_rows_pct": 52.0,
                                "in_rows_uncounted": [],
-                               "runs": "5/5" } },
+                               "runs": "5/5" },
+              "crowding": { "threads": 135, "cores": 8, "peak": 27,
+                            "above_cores_ms": 245.0, "runs": "5/5" } },
   "environment": { "cpu": { "mean_mhz": 1481.2, "mean_mhz_min": 1452.0,
                             "mean_mhz_max": 1503.9, "min_mhz": 300.0,
                             "max_mhz": 2400.0, "on_cpu_ms": 1945.0,
@@ -50,8 +52,13 @@ produce. The keys only a merged report has are named under the block.
                    "memory": { "available_mb_min": 1536.0, "major_faults": 250 },
                    "sampling": null,
                    "compose_names": null,
+                   "compile": { "filter": "speed-profile", "reason": "install-dm",
+                                "status": "up-to-date",
+                                "jit": { "methods": 7, "ms": 97.0 },
+                                "verified": { "classes": 9, "ms": 68.0, "main_ms": 5.3 },
+                                "runs": "5/5" },
                    "missing": [] },
-  "summary": { "detectors_run": 15, "detectors_fired": 4,
+  "summary": { "detectors_run": 16, "detectors_fired": 4,
                "fired_ids": ["main_thread_block", "…"], "absent_ids": [] },
   "config": { "path": "/abs/project/echolot.yml", "sha": "fadc1a11b903",
               "local": null, "defaults": false, "set": null },
@@ -138,6 +145,32 @@ names compares only with another with names, and `compare` says so when they
 differ. Asked for and none arrived is a warning in the header: an app
 without `runtime-tracing`, or an SDK nobody switched on.
 
+`compile` is how ART had compiled the app before it ran, read from the
+trace, and what it compiled while it ran. The same code runs at another speed
+under each: a large app's launch on one phone took ~1.4 s on its benchmark
+build and ~8.8 s on a debuggable build of it that nothing had compiled.
+
+- `filter`, `reason`, `status` — ART's slice for the app's own dex,
+  `location=… status=… filter=… reason=…`, read over the whole trace because
+  the process opens it at its start. `speed-profile` is compiled from a
+  profile, which is how an install from Google Play usually arrives, with
+  `reason` saying where the profile came from (`install-dm` from the build,
+  `bg-dexopt` widened later on the device). `verify` and `run-from-apk`
+  compiled none of the app's code ahead of time, and the report's header
+  warns. `null` when the trace does not hold the slice: the process was
+  already running when the recording began.
+- `jit` — the methods the JIT compiled inside the window, and its time.
+- `verified` — the classes ART verified at run time inside the window,
+  their time, and the part on the main thread (`main_ms`), which the user
+  waited for. Compiled code brings its classes verified; a library loaded
+  from elsewhere, or an app nothing compiled, verifies them here.
+
+Merged, the state is the one every repeat agrees on, or all of them joined
+by `and` — `run-from-apk and speed-profile` is a set of two builds, and the
+header says its medians mix two measurements. `runs` counts the repeats whose
+trace held the state. `compile` itself is `null` for a trace recorded without
+the `dalvik` atrace category, which `collect` records by default.
+
 `sampling` is whether a callstack sampler ran while the trace recorded —
 `runner.sampling`, or whatever config recorded the trace — read from the
 trace itself. `null` is a definite answer here: nothing sampled it, which is
@@ -216,6 +249,16 @@ is in the rows about other threads: `uninstrumented_cpu`, `io_wait`, a
 background `binder_txn`. A low share with the main thread mostly on a CPU
 means it ran code no row names: slices below the thresholds, or none at all —
 `echolot names` shows which, and `mark` names the rest.
+
+**`window.crowding`** — the app's threads against the device's cores, moment
+by moment: `peak`, the most of them running or ready to run at once,
+`above_cores_ms`, how long there were more than `cores`, and `threads`, how
+many had a state in the window. Merged, the medians. The header prints it
+under the budget when the threads outnumbered the cores: `App threads: up to
+27 running or ready at once on 8 cores, more than 8 for 245 ms of the
+window.` On a large app's launch that was the case behind the main thread's
+wait for a CPU: half of it was spent behind the app's own work. Read it with
+`waiting_for_cpu` and with `runnable_starvation`'s row for the main thread.
 
 **`window.startup`** — the app's launch as Perfetto's standard library
 measures it, when the trace holds one: `type` (cold, warm, hot), `dur_ms` from
@@ -369,6 +412,13 @@ away while these numbers were made. Neither is a reason to discard the report,
 and both are a reason to say so out loud before drawing a conclusion from a
 number that moved.
 
+**`environment.compile.filter` is `verify` or `run-from-apk`, or joins two
+with `and`** — in the first case none of the app's code was compiled ahead
+of time, and the numbers are slower than what most users see; say so before
+calling anything slow, and record again on a build compiled from its
+baseline profile. In the second the repeats ran two builds, or one build
+installed two ways, and no median in the report is either of them.
+
 **`toolchain.trace_processor`** — the parser version. If the numbers diverge
 between two reports, check this first: a version change alters trace semantics
 while the SQL stays identical. `source` says where the binary came from —
@@ -476,13 +526,14 @@ How much of the window the findings cover is `window.main_thread.in_rows_pct`.
 | `gc_pressure` | collection cycles and allocation waits | frequent GC = many intermediate objects |
 | `monitor_contention` | monitor contention | `places` names both sides of the lock in the checkout; `detail` carries the owner's tid |
 | `binder_txn` | synchronous IPC into another process | `count` and `total_ms`, not just `max_ms` |
-| `runnable_starvation` | thread ready but preempted | this is about the device, not the code |
+| `runnable_starvation` | thread ready but preempted | `state` names the row; on the main thread's row `detail` says who held its core — the app's own threads point at the app, other processes and idle cores at the device |
 | `uninstrumented_cpu` | threads burning CPU with no instrumentation | an address for adding `trace{}`; in a sampled recording, the method after `ours:` in `detail`, at the file `code` names |
 | `frame_jank` | frames that missed their deadline | `location` is why it missed, `detail` says whose fault |
 | `main_thread_outlier` | one occurrence far longer than usual | `detail` carries the median it is measured against |
 | `anr_risk` | a stretch where the main thread never got back to the message queue | `detail` splits it into on-CPU, waiting for a CPU, and neither |
 | `anr` | an ANR the system recorded during the trace | `location` is the platform's own reason, `detail` the error id |
 | `repeated_work` | the same named work entered from more than one caller | `detail` names the callers; a `near miss` row means the occurrences are too unlike to be one work |
+| `main_thread_kernel_waits` | the main thread's uninterruptible sleeps that are not the disk, by the thread of the app that ended them | `location` is that thread, digits folded; `detail` says what it was inside when it woke the main thread (`waking inside dlopen: libfoo.so 61%`), then where the main thread was. Most often the process's memory-map lock; the trace cannot say which lock |
 | `main_thread_waits` | the main thread's sleeps that a thread of the app ended | `location` is that thread, its digits folded (`arch_disk_io_#`, `DefaultDispatch`); `detail` says whether the main thread was idle or blocked, and in which slice, with the share of each when it was both. Lock waits, binder replies and `RenderThread` stay with their own detectors |
 | `io_wait` | threads the kernel parked waiting for a block device | `thread` says `main` or `background`, and so does `detail`; there is no code to look at, only I/O to remove or move |
 | `composables` | a Compose app's own composables, by the composition time they hold | `code` is the declaration the name carries; `detail` says what composed the calls: `in a first composition`, a view composed for the first time; `in a frame`, a recomposition after state changed; `during measure`, a lazy list composing its items; `elsewhere`, anything else. Silent without `runtime-tracing` in the app |
@@ -524,10 +575,24 @@ nothing. Put `AGENTTMP_` markers around the app's own there, or `echolot mark`,
 and record again; what stays unnamed after that is libraries, which the
 manifest's `<provider>` entries list.
 
-**`runnable_starvation`** talks about hardware, not code. A thread in state `R`
-is ready to work but the scheduler will not let it in. On an emulator it fires
-almost always. Do not send an agent to fix code over this finding — first make
-sure the run happened on a real device with nothing else loading it.
+**`runnable_starvation`** says who kept a thread off the CPU. A thread in
+state `R` is ready to work and the scheduler will not let it in. One row per
+thread and state: `state` (`R`, or `R+`, woken and not yet run) is part of the
+row's name. For the main thread `detail` goes on:
+
+    state R · its core held by the app 45% (DefaultDispatch most), other processes 48%, idle 7% · 0.3 other cores idle on average
+
+The share is of the time the main thread waited, by what ran on the core it
+was put on next. **Mostly the app** — the cause is in the app, however real
+the device: too many of its threads at once, work that could start after the
+first frame, a pool larger than the cores. The thread named is the one that
+held the core longest; `window.crowding` says how many there were. **Mostly
+other processes** — the device was busy with something else, and on an
+emulator it nearly always is: make sure the run happened on a real device
+with nothing else loading it before sending anyone to the code. **Mostly
+idle**, or many other cores idle on average — capacity stood by and the
+scheduler was slow to use it; neither doing less nor moving work fixes that.
+Background threads' rows carry the state alone.
 
 **`uninstrumented_cpu`** is the only one that finds a problem inside
 uninstrumented code. `covered_ms` far below `total_ms` means the thread worked
@@ -582,9 +647,29 @@ bonus, not the norm.
 Two readings that come with it. If the same scenario is clean on the second
 run, the first one was populating the page cache, and that is a first-launch
 problem rather than a code one. And a thread in `D` that this detector does
-*not* claim was parked for something other than the disk — look for other
-threads holding a memory lock, `Jit thread pool` and file-mapping work being
-the usual pair.
+*not* claim was parked for something other than the disk. For the main
+thread, `main_thread_kernel_waits` says which of the app's threads let it out.
+
+**`main_thread_kernel_waits`** is the main thread in `D` with `io_wait = 0` —
+asleep in the kernel, and the kernel says it is not the disk — counted by the
+thread of the app that woke it. No slice names that time: the budget calls it
+blocked in the kernel, and `main_thread_block` counts it as self time of
+whatever slice was open, where it reads as slow code.
+
+    waking inside dlopen: libimage.so 100% · main thread inside inflate 100%
+
+Read `detail` for what the waking thread was doing. Loading a native library,
+starting threads (ART's `InitStack`), creating the EGL context, opening dex or
+oat files: work that maps memory and takes the process's memory-map lock for
+writing, which every page fault of the main thread then waits behind. On a
+large app's cold launch that was ~106 ms of ~1.45 s, the coroutine pool's
+library loading first. The fix is in time, not in the main thread's code:
+move that work past the first frame, do less of it at once, reuse threads
+instead of starting new ones. What the trace cannot say on a production
+kernel is which lock it was — the GPU driver's and the file system's leave the
+same signature — so say "most likely the memory-map lock", not more. A
+`kernel:` part in `detail` is the function's name on a userdebug kernel, and
+settles it.
 
 **`frame_jank`** is the only detector that answers "which frames stuttered"
 rather than "where did the total go", and the only one that needs no
@@ -754,6 +839,7 @@ that pass: `AGENTTMP_fill_v4` is never taken for `AGENTTMP_fill_v6`.
 | `environment` | the clock the two rounds ran at differs by the relative floor or more (10% unless `--floor-pct` says otherwise), either way, or a side carries no clock, or read its clock or thermal state in only some of its repeats. A grown row may be the device rather than the app — say so before calling it a regression. Two rounds that recorded no platform state at all get no warning |
 | `environment-thermal` | the kernel throttled the device during one round and not the other: that side is slower for a reason outside the code. Only when both sides recorded thermal state |
 | `sampling` | a callstack sampler ran in one round and not the other, or at another rate, or in only some repeats of one. The sampled side is slower for a reason outside the code. A round whose sampler never started counts as plain, and a report from before the field gets no warning |
+| `compile` | the two rounds ran the app compiled differently — another `filter`, or the same filter from another profile (`reason`) — or one side's repeats did. Code compiled ahead of time runs faster than code the JIT compiles as the app runs, so a row can move for that reason alone. A side whose traces held no state, and a report from before the field, get no warning |
 | `instrumentation` | rows that appeared carry the config's `instrumentation.temp_prefix` — markers added between the rounds, a breakdown of a blind spot, not new work. Needs that key in the config |
 | `process` | two different apps. `comparable: false` |
 | `defaults` / `config` | one side used `--defaults`, or the config's hash changed |

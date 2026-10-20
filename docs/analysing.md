@@ -275,11 +275,24 @@ leave it. `detail` says whether the main thread was idle, with no slice open,
 or blocked, and in which slice; when it was both, it gives each a share. On a Compose
 app's first launch on an A51 the main thread was idle for 0.7 s of 2.1 s
 until Room's threads woke it about 260 times while the database filled. On a
-large Kotlin app's cold starts it blocked inside two SDKs' initializers until
-the thread loading SharedPreferences let it go, 58 ms on the median. A lock's
-wait stays with
+large Kotlin app it blocked inside two SDKs' initializers until the thread
+loading SharedPreferences let it go, 58 ms on the median. Those traces caught
+the end of a start the system had begun on its own, right after a force-stop,
+and the launch that followed was warm. A lock's wait stays with
 `monitor_contention`, a binder reply with `binder_txn`, and a sleep that
 `RenderThread` or another process ended is left out.
+
+`main_thread_kernel_waits` is the same reading of a different sleep: the main
+thread in the kernel for something other than the disk (`D`, `io_wait = 0`),
+by the thread of the app that let it out. Here `RenderThread` and binder
+threads count, since whichever thread released the lock is the finding. On a
+large Kotlin app's cold launch on an A51 that was ~106 ms a launch, 97% of it
+ended by the app's own threads, and where they had a slice open it was work
+that maps memory: native libraries loading, threads starting, the EGL
+context, dex files. A test app on the same phone confirmed the mechanism:
+with three threads mapping memory beside it, its main thread spent 2.3 s
+there instead of 5 ms. Which kernel lock it was, the trace does not say on a
+production build; on a userdebug kernel `detail` names the function.
 
 `frame_jank` needs no instrumentation at all: SurfaceFlinger records every
 frame's deadline and what it actually took, and says whose fault a miss was.
@@ -401,6 +414,22 @@ It costs time only on a trace that has a launch to break down: the breakdown's
 tables are computed when the module is included, which took 0.8 s on each of
 those starts.
 
+Under the device line the header says how ART had compiled the app, and what
+it compiled and verified while the window ran:
+
+```
+Compiled: **speed-profile** (install-dm) · JIT 7 methods, 97 ms · 9 classes verified at run time, 68 ms, 5 ms of it on the main thread
+```
+
+It is read from ART's own slice for the app's dex, so it holds for whatever
+build was on the device, whichever way it got there. `speed-profile` is the
+app compiled from a profile, which is how an install from Google Play usually
+arrives. `verify` and `run-from-apk` compiled none of it ahead of time, and
+the header warns: the interpreter and the JIT carried the launch, and its
+numbers are slower than what most users see. On the SM-A515F a large app's
+launch took ~1.4 s on its benchmark build and ~8.8 s on a debuggable build of
+it that nothing had compiled. `compare` warns when two rounds differ in it.
+
 ## From a row to a line, without `domains`
 
 Some rows name the code themselves. ART's contention slice carries both
@@ -463,7 +492,7 @@ Walking down to the code the same way for both wastes a round.
 ## Rows of Compose
 
 A Compose app writes its phases into the trace with nothing set up, and they
-become rows like any slice. On a large Compose app's cold start on an
+become rows like any slice. On a large Compose app's warm start on an
 SM-A515F they were 5 of the 20 `main_thread_block` rows, `Compose:recompose
 ×55, 224 ms` among them, and 6 of the 12 `main_thread_outlier` rows, one
 `Recomposer:recompose` of 314 ms among those. Where each one sits in the trace

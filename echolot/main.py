@@ -1351,6 +1351,7 @@ def _window_info(tp, cfg: Config, procs: list[dict]) -> dict:
     # this function lands somewhere else in the file — two of them arriving on
     # separate branches should not have to be merged by hand.
     window["main_thread"] = _main_thread_budget(tp, window)
+    window["crowding"] = _crowding_info(tp)
 
     for key, glob in (("start", cfg.scenario_start), ("end", cfg.scenario_end)):
         if glob == NO_ANCHOR:
@@ -1636,9 +1637,90 @@ def _environment_info(tp, package: str = "", mapped: bool = False) -> dict:
         if names:
             env["sampling"]["names"] = names
     env["compose_names"] = _compose_names_info(tp, one)
+    env["compile"] = _compile_info(tp, package, one)
     env["missing"] = sorted(k for k in ("cpu", "thermal", "memory")
                             if env[k] is None)
     return env
+
+
+# What ART writes when it opens a dex file, as a child of the
+# `OpenDexFilesFromOat(<path>)` it opened it for:
+#
+#   location=/data/app/~~…/com.example.app-…/oat/arm64/base.odex status=up-to-date filter=speed-profile reason=install-dm
+#   location=error status=io-error-no-oat filter=run-from-apk reason=unknown
+#
+# The second is a build with nothing compiled to open, and its `location`
+# names no file at all. That is why the app's own file is told by the
+# parent's path rather than by `location`.
+_DEX_STATE = re.compile(r"\bstatus=(\S+) filter=(\S+) reason=(\S+)")
+
+
+def _compile_info(tp, package: str, one) -> dict | None:
+    """How ART had compiled the app this trace ran, and what it compiled meanwhile.
+
+    The same code runs at very different speeds depending on it. Compiled
+    ahead of time from a profile (`speed-profile`), a launch runs the app's
+    hot code as machine code. Verified only (`verify`) or run from the APK
+    (`run-from-apk`), the interpreter and the JIT carry it. On an SM-A515F a
+    large app's launch took ~1.4 s on its benchmark build and ~8.8 s on a
+    debuggable build of the same app that nothing had compiled, and a
+    comparison of the two rounds would call every row a regression.
+
+    Three readings, from the `dalvik` atrace category that `collect` records
+    by default and a macrobenchmark's trace carries too:
+
+    - `filter`, `reason`, `status`: ART's slice for the app's own dex, read
+      over the whole trace, since the process opens it at its start, before
+      most windows open. `None` when the trace does not hold it: a process
+      that was already running when the recording began.
+    - `jit`: the methods the JIT compiled inside the window, and its time.
+    - `verified`: the classes ART verified at run time inside the window, a
+      class that compiled code would have carried verified already. Its time,
+      and the part of it on the main thread, which the user waited for.
+
+    `None` when the trace holds none of the three: a recording without the
+    `dalvik` category, or a window where nothing of the kind ran.
+    """
+    state: dict[str, Any] | None = None
+    if package:
+        try:
+            rows = tp.query(f"""
+                SELECT d.name AS name
+                FROM _slice d
+                JOIN slice x ON x.id = d.slice_id
+                JOIN slice o ON o.id = x.parent_id
+                WHERE d.name GLOB 'location=* filter=*'
+                  AND o.name GLOB 'OpenDexFilesFromOat(*/{sql_value(package)}-*'
+                ORDER BY d.ts
+                LIMIT 1""")
+        except Exception as e:  # a trace_processor without one of the tables
+            print(f"[!] environment: {e}", file=sys.stderr)
+            rows = []
+        found = _DEX_STATE.search(rows[0]["name"] or "") if rows else None
+        if found:
+            state = {"filter": found.group(2), "reason": found.group(3),
+                     "status": found.group(1)}
+    jit = one("SELECT COUNT(*) AS n, SUM(dur_win) AS ns FROM _slice_win "
+              "WHERE name GLOB 'JIT compiling *'")
+    # `VerifyClass ` with the space: `VerifyClassLoaderContextMatch` is ART
+    # checking a class loader, not a class. A verification inside another is
+    # counted once, by the outer one.
+    verified = one("""
+        SELECT COUNT(*) AS n, SUM(s.dur_win) AS ns,
+               SUM(CASE WHEN s.is_main_thread = 1 THEN s.dur_win ELSE 0 END) AS main_ns
+        FROM _slice_win s
+        WHERE s.name GLOB 'VerifyClass *'
+          AND NOT EXISTS (SELECT 1 FROM ancestor_slice(s.slice_id) a
+                          WHERE a.name GLOB 'VerifyClass *')""")
+    if state is None and not jit.get("n") and not verified.get("n"):
+        return None
+    out: dict[str, Any] = dict(state or {"filter": None, "reason": None, "status": None})
+    out["jit"] = {"methods": jit.get("n") or 0,
+                  "ms": round((jit.get("ns") or 0) / 1e6, 2)}
+    out["verified"] = {"classes": verified.get("n") or 0,
+                       "ms": round((verified.get("ns") or 0) / 1e6, 2),
+                       "main_ms": round((verified.get("main_ns") or 0) / 1e6, 2)}
+    return out
 
 
 # The recording's config asked for the Perfetto SDK's events when it holds a
@@ -1856,6 +1938,55 @@ def _main_thread_budget(tp, window: dict) -> dict | None:
     # explained" and "most of it was not looked at".
     out["accounted_pct"] = round(accounted / duration * 100, 1) if duration else None
     return out
+
+
+def _crowding_info(tp) -> dict | None:
+    """How many of the app's threads wanted a core at once, against how many cores there were.
+
+    The main thread's budget says how long it waited for a CPU, and
+    `runnable_starvation` who held the core meanwhile. This is the crowd
+    behind both: every thread of the app running or ready to run, counted
+    moment by moment across the window. On a large Kotlin app's launch on an
+    SM-A515F that was a peak of 27–28 threads on 8 cores, and more threads
+    ready than cores for ~250 ms of a ~1.4 s launch — the app crowding the
+    device out, not the device being busy.
+
+    `peak` is the most at one moment, `above_cores_ms` how long there were
+    more than `cores`, and `threads` how many of the app's threads had a
+    state in the window. Arithmetic over `_tstate_win`, like the budget, and
+    `None` for a trace with no scheduler data.
+    """
+    cores = (tp.query("SELECT COUNT(DISTINCT cpu) AS n FROM sched") or [{}])[0].get("n")
+    if not cores:
+        return None
+    # A start and an end at one moment are taken in that order, so that a
+    # thread switching from ready to running, or one leaving a core as
+    # another takes it, is never two threads at once.
+    rows = tp.query(f"""
+        WITH busy AS (
+            SELECT utid, ts, dur FROM _tstate_win
+            WHERE state IN ('Running', 'R', 'R+') AND dur > 0
+        ),
+        ev AS (
+            SELECT ts AS t, 1 AS d FROM busy
+            UNION ALL
+            SELECT ts + dur AS t, -1 AS d FROM busy
+        ),
+        level AS (
+            SELECT t, SUM(d) OVER (ORDER BY t, d ROWS UNBOUNDED PRECEDING) AS n,
+                   LEAD(t) OVER (ORDER BY t, d)                         AS next_t
+            FROM ev
+        )
+        SELECT (SELECT COUNT(DISTINCT utid) FROM _tstate_win)           AS threads,
+               MAX(n)                                                   AS peak,
+               SUM(CASE WHEN n > {int(cores)} AND next_t > t
+                        THEN next_t - t ELSE 0 END)                     AS above_ns
+        FROM level""")
+    if not rows or rows[0].get("peak") is None:
+        return None
+    return {"threads": rows[0]["threads"], "cores": int(cores),
+            "peak": rows[0]["peak"],
+            "above_cores_ms": round((rows[0]["above_ns"] or 0) / 1e6, 2)}
 
 
 def _spans_behind(tp, d, params: dict,
@@ -3122,14 +3253,25 @@ def cmd_collect(args) -> int:
               f"launches report TotalTime: 0 — the system timed no start "
               f"there, usually because the activity was already in front.",
               file=sys.stderr)
+    # Repeats that were stopped and found the process running again by their
+    # start (#404). A spread over them and the cold ones is two kinds of start,
+    # and the device is not what to blame for it.
+    restarted = [r for r in results if r.get("not_cold")]
     if len(times) > 1:
         spread = (max(times) - min(times)) / min(times) * 100
         print(f"\nam start -W: from {min(times)} to {max(times)} ms "
               f"(spread {spread:.0f}%)", file=sys.stderr)
-        if spread > 30:
+        if spread > 30 and not restarted:
             print("That spread is wide — the device is under load or has not "
                   "settled. Thresholds from such runs will be noisy.",
                   file=sys.stderr)
+    if restarted:
+        print(f"\n[!] {len(restarted)} of {len(results)} repeats did not start cold: the "
+              f"app was stopped before each, and its process was running again by "
+              f"its start. Those traces hold neither the process start nor "
+              f"bindApplication, and a report over the whole set mixes two kinds of "
+              f"start. `adb logcat -b events -d | grep am_proc_start` says what the "
+              f"system started it for.", file=sys.stderr)
 
     for r in results:
         print(r["path"])

@@ -409,10 +409,10 @@ def _(report):
 @check("clock: weighted by the cores this app actually held")
 def _(report):
     cpu = report["environment"]["cpu"]
-    # 1937 ms on a CPU inside the window, of which 417 ms on CPU 0 after it
-    # doubled at ms 600: (1520 × 1000 + 417 × 2000) / 1937.
-    assert cpu["on_cpu_ms"] == 1937.0, cpu
-    assert cpu["mean_mhz"] == 1215.3, cpu
+    # 1915 ms on a CPU inside the window, of which 417 ms on CPU 0 after it
+    # doubled at ms 600: (1498 × 1000 + 417 × 2000) / 1915.
+    assert cpu["on_cpu_ms"] == 1915.0, cpu
+    assert cpu["mean_mhz"] == 1217.8, cpu
     assert cpu["max_mhz"] == 2000.0, cpu
 
 
@@ -436,7 +436,7 @@ def _(report):
     # with the window applied first, there would be no frequency for the
     # beginning of the scenario and the coverage below would fall short.
     cpu = report["environment"]["cpu"]
-    assert cpu["measured_ms"] == 1937.0, (
+    assert cpu["measured_ms"] == 1915.0, (
         f"the pre-window sample did not carry into the window: {cpu}")
 
 
@@ -477,13 +477,16 @@ def _(report):
     assert env["missing"] == ["cpu", "memory", "thermal"], env
     assert env["cpu"] is None and env["thermal"] is None, env
     # The rest of the report is unaffected: platform state is context, and its
-    # absence costs one finding only. `io_wait` reads the disk flag from
-    # `sched/sched_blocked_reason`, one of the events such a recording leaves
-    # out, so it goes silent; every other detector fires as before.
-    io = next(d for d in bare["detectors"] if d["id"] == "io_wait")
-    assert not io["rows"] and not io.get("error"), io
+    # absence costs two findings only. `io_wait` and `main_thread_kernel_waits`
+    # read the disk flag from `sched/sched_blocked_reason`, one of the events
+    # such a recording leaves out, so both go silent rather than guess; every
+    # other detector fires as before.
+    flagged = ("io_wait", "main_thread_kernel_waits")
+    for d in bare["detectors"]:
+        if d["id"] in flagged:
+            assert not d["rows"] and not d.get("error"), d
     assert bare["summary"]["fired_ids"] == [
-        d for d in report["summary"]["fired_ids"] if d != "io_wait"], (
+        d for d in report["summary"]["fired_ids"] if d not in flagged], (
         bare["summary"]["fired_ids"], report["summary"]["fired_ids"])
 
 
@@ -786,6 +789,22 @@ def _(report):
     assert row["detail"] == "67% idle · 33% blocked in loadConfig", row
 
 
+@check("main_thread_kernel_waits: the main thread held in the kernel, by the thread that let it out")
+def _(report):
+    """20 ms in `D` with `io_wait = 0` inside `inflate`, ended by NativeLoader
+    while it ran `dlopen`: one row, named by the thread. Beside it, two of the
+    main thread's kernel sleeps that must stay out: the disk (`io_wait = 1`,
+    which is `io_wait`'s row) though the same thread ended it, and 2 ms of
+    non-disk sleep that another process ended. Plain sleeps (`S`) are
+    `main_thread_waits`', and a trace without the disk flag is silent here
+    (the platform-state check)."""
+    row = only_row(report, "main_thread_kernel_waits")
+    assert (row["location"], row["count"], row["total_ms"], row["max_ms"]) \
+        == ("NativeLoader", 1, 20.0, 20.0), row
+    assert row["detail"] == (
+        "waking inside dlopen: libimage.so 100% · main thread inside inflate 100%"), row
+
+
 @check("composable names: counted in the trace, with what the recording asked for")
 def _(report):
     """`compare` warns when one round had composable names and the other not,
@@ -802,6 +821,21 @@ def _(report):
         named = _analyze(path, Config(FIXTURE_CONFIG))
     assert named["environment"]["compose_names"] == {"asked": True, "calls": 10}, \
         named["environment"]["compose_names"]
+
+
+@check("compile state: the app's own dex, and what the JIT and the verifier did in the window")
+def _(report):
+    """`compare` warns when two rounds ran the app compiled differently, since
+    the same code runs at another speed compiled ahead of time than under
+    the JIT. The state is ART's slice for the app's own dex, told by the path
+    of the file it opened: the other package's dex before it, verified only,
+    is not the app's. Only the window's JIT and verification count, a nested
+    verification is its parent's time, and a class loader's check is not a
+    class. All of it on background threads here, so none on the main one."""
+    c = report["environment"]["compile"]
+    assert c == {"filter": "speed-profile", "reason": "install-dm", "status": "up-to-date",
+                 "jit": {"methods": 2, "ms": 10.0},
+                 "verified": {"classes": 2, "ms": 5.0, "main_ms": 0.0}}, c
 
 
 @check("composables: placed where the name says, and owned by the checkout")
@@ -1023,6 +1057,38 @@ def _(report):
     row = only_row(report, "runnable_starvation")
     assert row["location"] == "OkHttp Dispatcher", row
     assert row["total_ms"] == 50.0, row
+    # The state names the row; a background thread's row carries no more
+    # evidence than that.
+    assert (row["state"], row["detail"]) == ("R", "state R"), row
+    # The fixture never crowds the cores: no line about it in the header.
+    crowd = report["window"]["crowding"]
+    assert crowd == {"threads": 13, "cores": 9, "peak": 5, "above_cores_ms": 0.0}, crowd
+
+
+@check("runnable_starvation: who held the core the main thread waited for")
+def _(report):
+    """The crowded variant: the main thread queues 30 ms for CPU 0, which runs
+    a thread of the app for 18 of them, another process's for 8, and nothing
+    for 4. Of the other cores, CPUs 2, 4 and 6 stand idle the whole time and
+    CPU 8 for 20 ms: 3.7 idle on average. The 1 ns stretches of `R` that every
+    wakeup in this fixture leaves are counted, and change no share. Twelve
+    threads of the app then queue on CPU 9 beside the running main thread,
+    more than the ten cores the trace has from 889 ms to 953."""
+    from .config import Config
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "crowded.perfetto-trace"
+        path.write_bytes(fixture.build(crowded=True))
+        crowded = _analyze(path, Config(FIXTURE_CONFIG))
+    main = [r for r in rows(crowded, "runnable_starvation")
+            if r["location"] == fixture.THREADS[fixture.TID_MAIN]]
+    assert len(main) == 1, rows(crowded, "runnable_starvation")
+    row = main[0]
+    assert (row["state"], row["total_ms"]) == ("R", 30.0), row
+    assert row["detail"] == (
+        "state R · its core held by the app 60% (CrowdWorker most), other "
+        "processes 27%, idle 13% · 3.7 other cores idle on average"), row
+    crowd = crowded["window"]["crowding"]
+    assert crowd == {"threads": 26, "cores": 10, "peak": 13, "above_cores_ms": 64.0}, crowd
 
 
 @check("uninstrumented_cpu: found the thread without a single slice")
@@ -1170,7 +1236,7 @@ def _(report):
 
 @check("uninstrumented_cpu: coverage counts nested slices only once")
 def _(report):
-    """main: 857 ms of Running inside the window, with the AppStart slice
+    """main: 835 ms of Running inside the window, with the AppStart slice
     covering the whole window on top. Adding parent to children would exceed
     everything the thread ever did. The arithmetic has to be honest or on a
     real trace it will mask a genuine blind spot.
@@ -1187,8 +1253,8 @@ def _(report):
             "uninstrumented_cpu": {"max_covered_pct": 101}})
     by_thread = {r["location"]: r for r in rows(every, "uninstrumented_cpu")}
     main = by_thread.get("m.example.app")
-    assert main and main["covered_ms"] == main["total_ms"] == 857.0, (
-        "the main thread's slices nest; counted once they cover its 857 ms "
+    assert main and main["covered_ms"] == main["total_ms"] == 835.0, (
+        "the main thread's slices nest; counted once they cover its 835 ms "
         f"on a CPU exactly: {main}")
     heap = by_thread.get("HeapTaskDaemon")
     assert heap and heap["covered_ms"] == 80.0, (
@@ -3625,11 +3691,11 @@ def _(report):
                 "detectors": [{
                     "id": "runnable_starvation", "title": "t", "why": "",
                     "params": {}, "params_source": "default", "error": None,
-                    "identity": ["location", "detail"],
+                    "identity": ["location", "state"],
                     "rows": [
-                        {"location": "RenderThread", "count": 3,
+                        {"location": "RenderThread", "count": 3, "state": "R",
                          "total_ms": r_ms, "max_ms": r_ms, "detail": "state R"},
-                        {"location": "RenderThread", "count": 2,
+                        {"location": "RenderThread", "count": 2, "state": "R+",
                          "total_ms": rplus_ms, "max_ms": rplus_ms, "detail": "state R+"},
                     ]}]}
 

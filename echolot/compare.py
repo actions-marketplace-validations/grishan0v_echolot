@@ -61,8 +61,8 @@ def build(before: dict[str, Any], after: dict[str, Any], *,
     rows: list[dict[str, Any]] = []
     state_changed: list[dict[str, Any]] = []
 
-    by_id_before = {d["id"]: d for d in before.get("detectors", [])}
-    by_id_after = {d["id"]: d for d in after.get("detectors", [])}
+    by_id_before = {d["id"]: _upgraded(d) for d in before.get("detectors", [])}
+    by_id_after = {d["id"]: _upgraded(d) for d in after.get("detectors", [])}
 
     for det_id in [*by_id_before, *(k for k in by_id_after if k not in by_id_before)]:
         db = by_id_before.get(det_id)
@@ -240,6 +240,7 @@ def _check(before: dict, after: dict,
     out.extend(_environment_moved(before, after, floor_ratio))
     out.extend(_sampling_moved(before, after))
     out.extend(_compose_names_moved(before, after))
+    out.extend(_compile_moved(before, after))
 
     nb, na = _runs(before), _runs(after)
     if nb != na:
@@ -460,6 +461,55 @@ def _compose_names_moved(before: dict, after: dict) -> list[dict[str, str]]:
     }]
 
 
+def _compile_moved(before: dict, after: dict) -> list[dict[str, str]]:
+    """Whether the two rounds ran the app compiled the same way.
+
+    Code compiled ahead of time from a profile runs at another speed than
+    code the JIT compiles while the app runs. On an SM-A515F a large app's
+    launch took ~1.4 s on its benchmark build and ~8.8 s on a debuggable
+    build that nothing had compiled, and every row of a comparison between
+    them grows for that reason alone. The reason counts too: a profile
+    widened by background dexopt (`bg-dexopt`) compiles more than the one
+    the install brought (`install-dm`).
+
+    A report from before the field carries no `compile` and is unknown, and
+    so is a side whose traces did not hold the state: no sentence for either.
+    A side whose own repeats disagree gets one, whatever the other side did.
+    """
+    eb, ea = before.get("environment") or {}, after.get("environment") or {}
+    if "compile" not in eb or "compile" not in ea:
+        return []
+    cb, ca = eb["compile"] or {}, ea["compile"] or {}
+    out: list[dict[str, str]] = []
+    was, now = _compiled(cb), _compiled(ca)
+    if was and now and was != now:
+        out.append({
+            "id": "compile",
+            "text": f"The app was compiled differently: {was} before, {now} "
+                    f"after. Code compiled ahead of time runs faster than code "
+                    f"the JIT compiles as the app runs, so a row can move for "
+                    f"that reason alone. Record both rounds on builds "
+                    f"compiled the same way.",
+        })
+    for side, c in (("before", cb), ("after", ca)):
+        if " and " in (c.get("filter") or "") or " and " in (c.get("reason") or ""):
+            out.append({
+                "id": "compile",
+                "text": f"The {side} side's repeats ran on different compile "
+                        f"states ({_compiled(c)}), so its medians mix two "
+                        f"speeds of the same code. Record that side again on "
+                        f"one build, installed one way.",
+            })
+    return out
+
+
+def _compiled(c: dict | None) -> str | None:
+    """One side's compile state in words, for the sentences above."""
+    if not c or not c.get("filter"):
+        return None
+    return f"`{c['filter']}`" + (f" ({c['reason']})" if c.get("reason") else "")
+
+
 def _named(c: dict | None) -> str:
     """One side's composable names in words, for the sentence above."""
     if not c or not c.get("calls"):
@@ -558,6 +608,26 @@ def _failed(d: dict | None) -> bool:
 
 
 # --- pairing rows across two reports ---------------------------------------
+
+def _upgraded(d: dict) -> dict:
+    """A detector's block from an older report, read with the identity it has now.
+
+    `runnable_starvation` named a row by `detail`, `state R` or `state R+`,
+    until the main thread's evidence went into `detail`; the state is a column
+    of its own since. Paired on what both sides carry, an older report against
+    a newer one would be paired on `location` alone, and a thread's `R` row
+    would meet its `R+` row: the mistake `_match` exists to prevent. So the
+    older block gets its `state` read back out of `detail`.
+    """
+    identity = identity_of(d)
+    if d.get("id") != "runnable_starvation" or "state" in identity \
+            or "detail" not in identity:
+        return d
+    rows = [{**row, "state": str(row.get("detail") or "").removeprefix("state ")}
+            for row in d.get("rows") or []]
+    return {**d, "identity": ["state" if c == "detail" else c for c in identity],
+            "rows": rows}
+
 
 def _identity(db: dict | None, da: dict | None) -> tuple[str, ...]:
     """The columns that tell one row of this detector from another.
@@ -779,7 +849,15 @@ def _name(row: dict, identity: tuple[str, ...], how: str,
     halves are printed in the form they were matched in.
     """
     loc = str(row["location"])
-    detail = row.get("detail") if "detail" in identity else None
+    if "detail" in identity:
+        detail = row.get("detail")
+    else:
+        # A column of its own in the identity — `runnable_starvation`'s
+        # `state`, `io_wait`'s `thread` — tells two rows of one location
+        # apart the way `detail` does elsewhere, and is printed the same way.
+        named = [f"{c} {row[c]}" for c in identity
+                 if c != "location" and row.get(c) is not None]
+        detail = " · ".join(named) or None
     if how == "family":
         loc = family(loc, keep=keep)
         detail = None if detail is None else family(str(detail), keep=keep)
